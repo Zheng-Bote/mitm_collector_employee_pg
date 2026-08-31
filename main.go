@@ -44,7 +44,7 @@ import (
 var (
 	appName        = "PostgreSQL Employee-Org Collector"
 	appDescription = "Collects joined data from Employee and Org tables"
-	version        = "0.1.0"
+	version        = "0.4.0"
 )
 
 // TargetDBConfig defines parameters for the MitM target database passed via JSON CLI argument
