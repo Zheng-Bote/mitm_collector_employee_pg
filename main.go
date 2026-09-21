@@ -75,6 +75,7 @@ type CollectorArgs struct {
 	CursorColumn      string `json:"cursor_column"`
 	Topic             string `json:"topic"`
 	BusinessKeyColumn string `json:"business_key_column"`
+	DBWhereIn         map[string][]string `json:"db_where_in,omitempty"`
 }
 
 // StatusEvent is sent to the scheduler Unix socket
@@ -239,10 +240,14 @@ func main() {
 	cursorColumn := "" // No default, to allow tables without 'id'
 	topicName := "employee.data"
 	businessKeyCol := "id" // Default fallback
+	var dbWhereIn map[string][]string
 
 	if len(os.Args) >= 2 {
 		var colArgs CollectorArgs
 		if err := json.Unmarshal([]byte(os.Args[1]), &colArgs); err == nil {
+			if len(colArgs.DBWhereIn) > 0 {
+				dbWhereIn = colArgs.DBWhereIn
+			}
 			if colArgs.SourceName != "" {
 				targetCfg.SourceName = colArgs.SourceName
 			}
@@ -471,25 +476,43 @@ func main() {
 	// 13. Query source table
 	var rows pgx.Rows
 	var queryArgs []interface{}
-	var query string
+	baseSQL := fmt.Sprintf("SELECT * FROM %s", sanitizedTable)
+	var conditions []string
 
-	if lastCursor != "" && cursorColumn != "" {
-		var cursorVal interface{} = lastCursor
-		if val, err := strconv.Atoi(lastCursor); err == nil {
-			cursorVal = val
-		} else if val, err := strconv.ParseFloat(lastCursor, 64); err == nil {
-			cursorVal = val
+	if len(dbWhereIn) > 0 {
+		for col, vals := range dbWhereIn {
+			if err := validateIdentifier(col); err != nil {
+				if ipc != nil {
+					ipc.SendEvent("failed", fmt.Sprintf("Invalid column name in db_where_in: %s", col), 0)
+				}
+				log.Fatalf("Invalid column name in db_where_in: %s", col)
+			}
+			if len(vals) == 0 {
+				continue
+			}
+			var placeholders []string
+			for _, val := range vals {
+				queryArgs = append(queryArgs, val)
+				placeholders = append(placeholders, fmt.Sprintf("$%d", len(queryArgs)))
+			}
+			conditions = append(conditions, fmt.Sprintf("%s IN (%s)", col, strings.Join(placeholders, ", ")))
 		}
-		query = fmt.Sprintf(`SELECT e.*, o.orgid, o.short, o.parent_org_id FROM %s e LEFT JOIN org o ON e.departmentcode = o.short WHERE e.%s > $1 ORDER BY e.%s ASC`,
-			sanitizedTable, cursorColumn, cursorColumn)
-		queryArgs = append(queryArgs, cursorVal)
-	} else if cursorColumn != "" {
-		query = fmt.Sprintf(`SELECT e.*, o.orgid, o.short, o.parent_org_id FROM %s e LEFT JOIN org o ON e.departmentcode = o.short ORDER BY e.%s ASC`,
-			sanitizedTable, cursorColumn)
-	} else {
-		query = fmt.Sprintf(`SELECT e.*, o.orgid, o.short, o.parent_org_id FROM %s e LEFT JOIN org o ON e.departmentcode = o.short`, sanitizedTable)
 	}
 
+	if lastCursor != "" && cursorColumn != "" {
+		queryArgs = append(queryArgs, lastCursor)
+		conditions = append(conditions, fmt.Sprintf("%s > $%d", cursorColumn, len(queryArgs)))
+	}
+
+	if len(conditions) > 0 {
+		baseSQL += " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	if cursorColumn != "" {
+		baseSQL += fmt.Sprintf(" ORDER BY %s ASC", cursorColumn)
+	}
+
+	query := baseSQL
 	rows, err = sourcePool.Query(ctx, query, queryArgs...)
 	if err != nil {
 		ipc.SendEvent("failed", fmt.Sprintf("Failed to query source database: %v", err), 0)
@@ -589,6 +612,7 @@ func main() {
 		values, err := rows.Values()
 		if err != nil {
 			log.Printf("Failed to scan PostgreSQL row: %v", err)
+			recordsFailed++
 			continue
 		}
 
@@ -610,6 +634,7 @@ func main() {
 		rowJSON, err := json.Marshal(rowMap)
 		if err != nil {
 			log.Printf("Failed to marshal row to JSON: %v", err)
+			recordsFailed++
 			continue
 		}
 
@@ -617,6 +642,7 @@ func main() {
 		nonce := make([]byte, 12)
 		if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 			log.Printf("Failed to generate random nonce: %v", err)
+			recordsFailed++
 			continue
 		}
 
@@ -630,7 +656,9 @@ func main() {
 		} else if currentCursorVal != "" {
 			businessKey = currentCursorVal
 		} else {
-			businessKey = uuid.New().String()
+			log.Printf("Missing business key for record, skipping")
+			recordsFailed++
+			continue
 		}
 
 		// Generate deterministic Correlation ID
